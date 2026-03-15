@@ -518,8 +518,8 @@ internal sealed class MusicSyncController : MonoBehaviour
         var byTrackIdentity = -1;
         var byAudioFileStem = -1;
         var byLooseIdentity = -1;
-        var byAudioHash = -1;
         var byTrackName = -1;
+        var trackIdentityMatches = 0;
 
         for (var i = 0; i < music.MusicTracks.Count; i++)
         {
@@ -542,6 +542,12 @@ internal sealed class MusicSyncController : MonoBehaviour
                 byTrackIdentity = i;
             }
 
+            if (localTrackName == normalizedTrackName &&
+                localArtistName == normalizedArtistName)
+            {
+                trackIdentityMatches++;
+            }
+
             if (byAudioFileStem < 0 &&
                 !string.IsNullOrWhiteSpace(normalizedAudioFileStem) &&
                 ResolveAudioFileStem(localTrack) == normalizedAudioFileStem)
@@ -556,22 +562,10 @@ internal sealed class MusicSyncController : MonoBehaviour
                 byLooseIdentity = i;
             }
 
-            if (byAudioHash < 0 &&
-                !string.IsNullOrWhiteSpace(state.AudioFileHash) &&
-                ResolveAudioFileHash(localTrack) == state.AudioFileHash)
-            {
-                byAudioHash = i;
-            }
-
             if (byTrackName < 0 && localTrackName == normalizedTrackName)
             {
                 byTrackName = i;
             }
-        }
-
-        if (byAudioHash >= 0)
-        {
-            return byAudioHash;
         }
 
         if (byAudioFileStem >= 0)
@@ -582,6 +576,22 @@ internal sealed class MusicSyncController : MonoBehaviour
         if (byTrackIdentityAndNumber >= 0)
         {
             return byTrackIdentityAndNumber;
+        }
+
+        if (byTrackIdentity >= 0 && trackIdentityMatches == 1)
+        {
+            return byTrackIdentity;
+        }
+
+        if (!string.IsNullOrWhiteSpace(state.AudioFileHash))
+        {
+            for (var i = 0; i < music.MusicTracks.Count; i++)
+            {
+                if (ResolveAudioFileHash(music.MusicTracks[i]) == state.AudioFileHash)
+                {
+                    return i;
+                }
+            }
         }
 
         if (byTrackIdentity >= 0)
