@@ -4,9 +4,11 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using FishNet;
 using FishNet.Connection;
+using FishNet.Managing.Transporting;
 using FishNet.Object;
 using FishNet.Transporting;
 using HarmonyLib;
@@ -28,19 +30,29 @@ internal sealed class MusicSyncController : MonoBehaviour
     private const float LobbyPollIntervalSeconds = 0.75f;
     private const float AllowedTimeDriftSeconds = 0.75f;
     private const float TrackTransferRequestRetrySeconds = 3f;
+    private const float TrackTransferStallTimeoutSeconds = 5f;
     private const float TransferProgressLogIntervalSeconds = 2f;
     private const float DuplicatePublishWindowSeconds = 0.2f;
     private const float DuplicatePublishPositionToleranceSeconds = 0.2f;
     private const int TransferProgressBarWidth = 24;
-    private const int TransferChunksPerFrame = 4;
-    private const int TransferChunkSizeBytes = 640;
-    private const int TransferWindowChunks = 24;
-    private const int TransferAckEveryChunks = 8;
+    private const int RawTransferMagic = 0x53534D54;
+    private const byte RawTransferVersion = 1;
+    private const int RawTransferHeaderBudgetBytes = 128;
+    private const int MinTransferChunkSizeBytes = 384;
     private const int MaxTransferSizeBytes = 32 * 1024 * 1024;
     private const int TransferTrackNumberStart = 1_000_000;
+    private static readonly TransferProfile[] TransferProfiles =
+    {
+        new("default", 4, 640),
+        new("safe", 3, 576),
+        new("safer", 2, 512),
+        new("fallback", 2, 448),
+        new("minimum", 1, 384)
+    };
 
     private static readonly MethodInfo LoadTrackMethod = AccessTools.Method(typeof(SetMenuMusicVolume), "LoadTrack");
     private static readonly FieldInfo TrackNumberToIndexField = AccessTools.Field(typeof(SetMenuMusicVolume), "TrackNumberToIndex");
+    private static readonly FieldInfo TransportField = AccessTools.Field(typeof(TransportManager), "Transport");
     private static readonly Regex LooseTokenRegex = new("[^\\p{L}\\p{Nd}]+", RegexOptions.Compiled);
     private static readonly Regex LeadingTrackNumberRegex = new("^\\s*\\d+\\s*-\\s*", RegexOptions.Compiled);
     private static readonly Regex MultiWhitespaceRegex = new("\\s+", RegexOptions.Compiled);
@@ -71,6 +83,8 @@ internal sealed class MusicSyncController : MonoBehaviour
     private MusicSyncWireMessage pendingState;
     private readonly Dictionary<string, IncomingTrackTransfer> incomingTrackTransfers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, OutgoingTrackTransfer> outgoingTrackTransfers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, NetworkConnection> clientConnectionsBySteamId = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> preferredTransferProfileIndexByKey = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> activeHostTransferKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> requestedTrackTransferKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, float> requestedTrackTransferAtByKey = new(StringComparer.OrdinalIgnoreCase);
@@ -157,6 +171,7 @@ internal sealed class MusicSyncController : MonoBehaviour
             nextLobbyPollAt = Time.unscaledTime + LobbyPollIntervalSeconds;
         }
 
+        CleanupStalledIncomingTransfers();
         TryApplyPendingState();
 
         if (Time.unscaledTime >= nextClientRequestAt &&
@@ -231,6 +246,21 @@ internal sealed class MusicSyncController : MonoBehaviour
     internal static void PublishHostState(float? positionSeconds = null, bool? paused = null)
     {
         Instance?.PublishHostStateInternal(positionSeconds, paused);
+    }
+
+    internal static void NotifyTransportLimitExceeded(bool serverSide)
+    {
+        Instance?.HandleTransportLimitExceeded(serverSide);
+    }
+
+    internal static bool TryHandleRawClientTransportData(ClientReceivedDataArgs args)
+    {
+        return Instance != null && Instance.TryHandleRawClientTransportDataInternal(args);
+    }
+
+    internal static bool TryHandleRawServerTransportData(ServerReceivedDataArgs args)
+    {
+        return Instance != null && Instance.TryHandleRawServerTransportDataInternal(args);
     }
 
     private void PublishHostStateInternal(float? positionSeconds = null, bool? paused = null)
@@ -365,15 +395,6 @@ internal sealed class MusicSyncController : MonoBehaviour
                 pendingState = wireMessage;
                 TryApplyPendingState();
                 return;
-            case MusicSyncMessageType.TrackTransferStart:
-                HandleTrackTransferStart(wireMessage);
-                return;
-            case MusicSyncMessageType.TrackTransferChunk:
-                HandleTrackTransferChunk(wireMessage);
-                return;
-            case MusicSyncMessageType.TrackTransferFailed:
-                HandleTrackTransferFailed(wireMessage);
-                return;
         }
     }
 
@@ -389,6 +410,8 @@ internal sealed class MusicSyncController : MonoBehaviour
             return;
         }
 
+        RememberClientConnection(connection, wireMessage.SourceSteamId);
+
         switch (wireMessage.MessageType)
         {
             case MusicSyncMessageType.Request:
@@ -396,12 +419,6 @@ internal sealed class MusicSyncController : MonoBehaviour
                 return;
             case MusicSyncMessageType.RequestTrackTransfer:
                 StartTrackTransferToClient(connection, wireMessage);
-                return;
-            case MusicSyncMessageType.RequestTrackTransferChunk:
-                SendRequestedTransferChunk(connection, wireMessage);
-                return;
-            case MusicSyncMessageType.TrackTransferProgress:
-                HandleClientTrackTransferProgress(wireMessage);
                 return;
         }
     }
@@ -941,28 +958,40 @@ internal sealed class MusicSyncController : MonoBehaviour
             return;
         }
 
-        connection = ResolveTargetConnection(connection, targetSteamId, $"starting host track transfer for {GetTrackIdentity(request)}");
-        if (connection == null)
+        var targetConnectionId = connection.ClientId;
+        var activeTransferKey = $"{targetConnectionId}|{transferKey}";
+        if (activeHostTransferKeys.Contains(activeTransferKey) && !outgoingTrackTransfers.ContainsKey(activeTransferKey))
         {
-            return;
+            activeHostTransferKeys.Remove(activeTransferKey);
+            Plugin.LogWarning($"[MusicSync] Clearing stale host transfer state for {GetTrackIdentity(request)} to client {targetSteamId}.", true);
         }
 
-        var activeTransferKey = $"{targetSteamId}|{transferKey}";
+        if (outgoingTrackTransfers.TryGetValue(activeTransferKey, out _))
+        {
+            outgoingTrackTransfers.Remove(activeTransferKey);
+            activeHostTransferKeys.Remove(activeTransferKey);
+            Plugin.LogWarning($"[MusicSync] Restarting stalled host track transfer for {GetTrackIdentity(request)} to client {targetSteamId}.", true);
+        }
+
         if (!activeHostTransferKeys.Add(activeTransferKey))
         {
             return;
         }
 
+        var profileIndex = GetPreferredTransferProfileIndex(targetSteamId);
+        var profile = GetTransferProfile(profileIndex);
+        var chunkSizeBytes = ResolveTransferChunkSizeBytes(profile);
+
         if (!TryResolveTrackForTransfer(request, out var track, out var localPath))
         {
-            SendTrackTransferFailure(connection, targetSteamId, request, "Host track was not found.");
+            SendTrackTransferFailure(connection, transferKey, request, "Host track was not found.");
             activeHostTransferKeys.Remove(activeTransferKey);
             return;
         }
 
         if (!File.Exists(localPath))
         {
-            SendTrackTransferFailure(connection, targetSteamId, request, "Host audio file is missing on disk.");
+            SendTrackTransferFailure(connection, transferKey, request, "Host audio file is missing on disk.");
             activeHostTransferKeys.Remove(activeTransferKey);
             return;
         }
@@ -970,14 +999,14 @@ internal sealed class MusicSyncController : MonoBehaviour
         var fileSize = new FileInfo(localPath).Length;
         if (fileSize <= 0L)
         {
-            SendTrackTransferFailure(connection, targetSteamId, request, "Host audio file is empty.");
+            SendTrackTransferFailure(connection, transferKey, request, "Host audio file is empty.");
             activeHostTransferKeys.Remove(activeTransferKey);
             return;
         }
 
         if (fileSize > MaxTransferSizeBytes)
         {
-            SendTrackTransferFailure(connection, targetSteamId, request, $"Host audio file is too large to quick-transfer ({fileSize / (1024f * 1024f):0.0} MB).");
+            SendTrackTransferFailure(connection, transferKey, request, $"Host audio file is too large to quick-transfer ({fileSize / (1024f * 1024f):0.0} MB).");
             activeHostTransferKeys.Remove(activeTransferKey);
             return;
         }
@@ -989,7 +1018,7 @@ internal sealed class MusicSyncController : MonoBehaviour
         }
         catch (Exception ex)
         {
-            SendTrackTransferFailure(connection, targetSteamId, new MusicSyncWireMessage
+            SendTrackTransferFailure(connection, transferKey, new MusicSyncWireMessage
             {
                 TrackNumber = track.TrackNumber,
                 TrackName = track.TrackName,
@@ -1004,8 +1033,9 @@ internal sealed class MusicSyncController : MonoBehaviour
         var transfer = new OutgoingTrackTransfer
         {
             TransferKey = activeTransferKey,
-            ClientTransferKey = transferKey,
+            TransferToken = transferKey,
             Connection = connection,
+            TargetConnectionId = targetConnectionId,
             TargetSteamId = targetSteamId,
             TrackNumber = track.TrackNumber,
             TrackName = track.TrackName,
@@ -1014,89 +1044,86 @@ internal sealed class MusicSyncController : MonoBehaviour
             AudioFileStem = ResolveAudioFileStem(track),
             AudioFileExtension = Path.GetExtension(localPath).ToLowerInvariant(),
             FileBytes = fileBytes,
-            ChunkCount = Mathf.CeilToInt(fileBytes.Length / (float)TransferChunkSizeBytes),
+            ChunkSizeBytes = chunkSizeBytes,
+            ChunkCount = Mathf.CeilToInt(fileBytes.Length / (float)chunkSizeBytes),
+            ProfileIndex = profileIndex,
             NextClientProgressLogAt = Time.unscaledTime + TransferProgressLogIntervalSeconds,
             NextProgressLogAt = Time.unscaledTime + TransferProgressLogIntervalSeconds
         };
         outgoingTrackTransfers[activeTransferKey] = transfer;
-        var localSteamId = GetLocalSteamId();
 
-        BroadcastToClient(connection, new MusicSyncWireMessage
+        if (!TrySendRawTrackTransferStart(connection, transfer))
         {
-            MessageType = MusicSyncMessageType.TrackTransferStart,
-            TransferToken = transfer.ClientTransferKey,
-            TargetSteamId = targetSteamId,
-            SourceSteamId = localSteamId,
-            TrackNumber = transfer.TrackNumber,
-            TrackName = transfer.TrackName,
-            ArtistName = transfer.ArtistName,
-            AudioFileHash = transfer.AudioFileHash,
-            AudioFileStem = transfer.AudioFileStem,
-            AudioFileExtension = transfer.AudioFileExtension,
-            FileSizeBytes = fileBytes.Length,
-            ChunkCount = transfer.ChunkCount
-        });
+            outgoingTrackTransfers.Remove(activeTransferKey);
+            activeHostTransferKeys.Remove(activeTransferKey);
+            return;
+        }
 
-        Plugin.LogInfo($"[MusicSync] Streaming host track {GetTrackIdentity(transfer.ToWireMessage())} to client {targetSteamId}.", true, Plugin.LogColorAccent);
+        Plugin.LogInfo($"[MusicSync] Streaming host track {GetTrackIdentity(transfer.ToWireMessage())} to client {targetSteamId} using {DescribeTransferProfile(profileIndex)}.", true, Plugin.LogColorAccent);
         StartCoroutine(StreamTrackTransferToClient(activeTransferKey));
     }
 
-    private void SendRequestedTransferChunk(NetworkConnection connection, MusicSyncWireMessage request)
+    private bool TryHandleRawClientTransportDataInternal(ClientReceivedDataArgs args)
     {
-        var targetSteamId = request.SourceSteamId;
-        var transferKey = GetTransferKey(request);
-        if (string.IsNullOrWhiteSpace(targetSteamId) || string.IsNullOrWhiteSpace(transferKey))
+        if (!TryCreateRawPacketReader(args.Data, out var reader, out var packetType))
         {
-            return;
+            return false;
         }
 
-        connection = ResolveTargetConnection(connection, targetSteamId, $"sending chunk {request.ChunkIndex} for {GetTrackIdentity(request)}");
-        if (connection == null)
+        using (reader)
         {
-            return;
+            try
+            {
+                switch (packetType)
+                {
+                    case MusicSyncTransferPacketType.Start:
+                        HandleRawTrackTransferStart(reader);
+                        return true;
+                    case MusicSyncTransferPacketType.Chunk:
+                        HandleRawTrackTransferChunk(reader);
+                        return true;
+                    case MusicSyncTransferPacketType.Failed:
+                        HandleRawTrackTransferFailure(reader);
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogWarning($"[MusicSync] Failed to process a raw host transfer packet: {ex.Message}", true);
+                return true;
+            }
+        }
+    }
+
+    private bool TryHandleRawServerTransportDataInternal(ServerReceivedDataArgs args)
+    {
+        if (!TryCreateRawPacketReader(args.Data, out var reader, out var packetType))
+        {
+            return false;
         }
 
-        var activeTransferKey = $"{targetSteamId}|{transferKey}";
-        if (!outgoingTrackTransfers.TryGetValue(activeTransferKey, out var transfer))
+        using (reader)
         {
-            SendTrackTransferFailure(connection, targetSteamId, request, "Host transfer session is no longer available.");
-            activeHostTransferKeys.Remove(activeTransferKey);
-            return;
-        }
-
-        var chunkIndex = request.ChunkIndex;
-        if (chunkIndex < 0 || chunkIndex >= transfer.ChunkCount)
-        {
-            SendTrackTransferFailure(connection, targetSteamId, request, "Requested transfer chunk is out of range.");
-            outgoingTrackTransfers.Remove(activeTransferKey);
-            activeHostTransferKeys.Remove(activeTransferKey);
-            return;
-        }
-
-        var offset = chunkIndex * TransferChunkSizeBytes;
-        var count = Mathf.Min(TransferChunkSizeBytes, transfer.FileBytes.Length - offset);
-        BroadcastToClient(connection, new MusicSyncWireMessage
-        {
-            MessageType = MusicSyncMessageType.TrackTransferChunk,
-            TargetSteamId = targetSteamId,
-            SourceSteamId = GetLocalSteamId(),
-            TrackNumber = transfer.TrackNumber,
-            TrackName = transfer.TrackName,
-            ArtistName = transfer.ArtistName,
-            AudioFileHash = transfer.AudioFileHash,
-            AudioFileStem = transfer.AudioFileStem,
-            AudioFileExtension = transfer.AudioFileExtension,
-            FileSizeBytes = transfer.FileBytes.Length,
-            ChunkIndex = chunkIndex,
-            ChunkCount = transfer.ChunkCount,
-            ChunkDataBase64 = Convert.ToBase64String(transfer.FileBytes, offset, count)
-        });
-
-        if (chunkIndex + 1 >= transfer.ChunkCount)
-        {
-            Plugin.LogInfo($"[MusicSync] Completed host track transfer for {GetTrackIdentity(transfer.ToWireMessage())} to client {targetSteamId}.", true, Plugin.LogColorSuccess);
-            outgoingTrackTransfers.Remove(activeTransferKey);
-            activeHostTransferKeys.Remove(activeTransferKey);
+            try
+            {
+                switch (packetType)
+                {
+                    case MusicSyncTransferPacketType.Progress:
+                        HandleRawClientTrackTransferProgress(args.ConnectionId, reader);
+                        args.FinalizeMethod?.Invoke();
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogWarning($"[MusicSync] Failed to process a raw client transfer packet: {ex.Message}", true);
+                args.FinalizeMethod?.Invoke();
+                return true;
+            }
         }
     }
 
@@ -1122,13 +1149,22 @@ internal sealed class MusicSyncController : MonoBehaviour
         return !string.IsNullOrWhiteSpace(localPath);
     }
 
-    private void HandleTrackTransferStart(MusicSyncWireMessage wireMessage)
+    private void HandleRawTrackTransferStart(BinaryReader reader)
     {
-        var transferKey = GetTransferKey(wireMessage);
+        var transferKey = reader.ReadString();
         if (string.IsNullOrWhiteSpace(transferKey))
         {
             return;
         }
+
+        var trackNumber = reader.ReadInt32();
+        var trackName = reader.ReadString();
+        var artistName = reader.ReadString();
+        var audioFileHash = reader.ReadString();
+        var audioFileStem = reader.ReadString();
+        var audioFileExtension = reader.ReadString();
+        var fileSizeBytes = reader.ReadInt32();
+        var chunkCount = reader.ReadInt32();
 
         CleanupIncomingTransfer(transferKey);
         Directory.CreateDirectory(GetMusicFolderPath());
@@ -1139,22 +1175,21 @@ internal sealed class MusicSyncController : MonoBehaviour
             incomingTrackTransfers[transferKey] = new IncomingTrackTransfer
             {
                 TransferKey = transferKey,
-                SourceSteamId = wireMessage.SourceSteamId,
-                RequesterSteamId = string.IsNullOrWhiteSpace(wireMessage.TargetSteamId) ? GetLocalSteamId() : wireMessage.TargetSteamId,
-                AudioFileHash = wireMessage.AudioFileHash,
-                AudioFileStem = wireMessage.AudioFileStem,
-                AudioFileExtension = string.IsNullOrWhiteSpace(wireMessage.AudioFileExtension) ? ".mp3" : wireMessage.AudioFileExtension,
-                ChunkCount = wireMessage.ChunkCount,
-                FileSizeBytes = wireMessage.FileSizeBytes,
+                AudioFileHash = audioFileHash,
+                AudioFileStem = audioFileStem,
+                AudioFileExtension = string.IsNullOrWhiteSpace(audioFileExtension) ? ".mp3" : audioFileExtension,
+                ChunkCount = Mathf.Max(0, chunkCount),
+                FileSizeBytes = Mathf.Max(0, fileSizeBytes),
                 TempPath = tempPath,
-                TrackName = wireMessage.TrackName,
-                ArtistName = wireMessage.ArtistName,
-                TrackNumber = wireMessage.TrackNumber,
+                TrackName = trackName,
+                ArtistName = artistName,
+                TrackNumber = trackNumber,
                 NextProgressLogAt = Time.unscaledTime + TransferProgressLogIntervalSeconds,
+                LastChunkReceivedAt = Time.unscaledTime,
                 Stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None)
             };
 
-            Plugin.LogInfo($"[MusicSync] Receiving host track {GetTrackIdentity(wireMessage)} ({wireMessage.FileSizeBytes / 1024f:0.0} KB).", true, Plugin.LogColorAccent);
+            Plugin.LogInfo($"[MusicSync] Receiving host track {GetTrackIdentity(new MusicSyncWireMessage { TrackNumber = trackNumber, TrackName = trackName, ArtistName = artistName })} ({fileSizeBytes / 1024f:0.0} KB).", true, Plugin.LogColorAccent);
         }
         catch (Exception ex)
         {
@@ -1163,15 +1198,17 @@ internal sealed class MusicSyncController : MonoBehaviour
         }
     }
 
-    private void HandleTrackTransferChunk(MusicSyncWireMessage wireMessage)
+    private void HandleRawTrackTransferChunk(BinaryReader reader)
     {
-        var transferKey = GetTransferKey(wireMessage);
+        var transferKey = reader.ReadString();
         if (string.IsNullOrWhiteSpace(transferKey) || !incomingTrackTransfers.TryGetValue(transferKey, out var transfer))
         {
             return;
         }
 
-        if (wireMessage.ChunkIndex != transfer.NextChunkIndex)
+        var chunkIndex = reader.ReadInt32();
+        var payloadLength = reader.ReadInt32();
+        if (chunkIndex != transfer.NextChunkIndex || payloadLength < 0)
         {
             Plugin.LogWarning($"[MusicSync] Host track transfer chunk arrived out of order for {GetTrackIdentity(new MusicSyncWireMessage { TrackNumber = transfer.TrackNumber, TrackName = transfer.TrackName, ArtistName = transfer.ArtistName })}. Restarting request on the next sync.", true);
             ClearRequestedTrackTransfer(transferKey);
@@ -1179,14 +1216,23 @@ internal sealed class MusicSyncController : MonoBehaviour
             return;
         }
 
+        var bytes = reader.ReadBytes(payloadLength);
+        if (bytes.Length != payloadLength)
+        {
+            ClearRequestedTrackTransfer(transferKey);
+            CleanupIncomingTransfer(transferKey);
+            Plugin.LogWarning($"[MusicSync] Host track transfer chunk was truncated for {GetTrackIdentity(new MusicSyncWireMessage { TrackNumber = transfer.TrackNumber, TrackName = transfer.TrackName, ArtistName = transfer.ArtistName })}.", true);
+            return;
+        }
+
         try
         {
-            var bytes = Convert.FromBase64String(wireMessage.ChunkDataBase64 ?? string.Empty);
             transfer.Stream.Write(bytes, 0, bytes.Length);
             transfer.ReceivedBytes += bytes.Length;
             transfer.NextChunkIndex++;
-            MaybeSendIncomingTransferAck(transfer, transfer.NextChunkIndex >= transfer.ChunkCount || transfer.NextChunkIndex - transfer.LastAcknowledgedChunkIndex >= TransferAckEveryChunks);
+            transfer.LastChunkReceivedAt = Time.unscaledTime;
             MaybeLogIncomingTransferProgress(transfer);
+            MaybeSendIncomingTransferProgress(transfer);
 
             if (transfer.NextChunkIndex >= transfer.ChunkCount || transfer.ReceivedBytes >= transfer.FileSizeBytes)
             {
@@ -1201,17 +1247,51 @@ internal sealed class MusicSyncController : MonoBehaviour
         }
     }
 
-    private void HandleTrackTransferFailed(MusicSyncWireMessage wireMessage)
+    private void HandleRawTrackTransferFailure(BinaryReader reader)
     {
-        var transferKey = GetTransferKey(wireMessage);
+        var transferKey = reader.ReadString();
+        var trackNumber = reader.ReadInt32();
+        var trackName = reader.ReadString();
+        var artistName = reader.ReadString();
+        var reason = reader.ReadString();
+
         if (!string.IsNullOrWhiteSpace(transferKey))
         {
             ClearRequestedTrackTransfer(transferKey);
             CleanupIncomingTransfer(transferKey);
         }
 
-        var reason = string.IsNullOrWhiteSpace(wireMessage.ErrorMessage) ? "Host rejected the transfer request." : wireMessage.ErrorMessage.Trim();
-        Plugin.LogWarning($"[MusicSync] Host could not transfer {GetTrackIdentity(wireMessage)}: {reason}", true);
+        var displayReason = string.IsNullOrWhiteSpace(reason) ? "Host rejected the transfer request." : reason.Trim();
+        Plugin.LogWarning($"[MusicSync] Host could not transfer {GetTrackIdentity(new MusicSyncWireMessage { TrackNumber = trackNumber, TrackName = trackName, ArtistName = artistName })}: {displayReason}", true);
+    }
+
+    private void HandleRawClientTrackTransferProgress(int connectionId, BinaryReader reader)
+    {
+        var transferToken = reader.ReadString();
+        if (string.IsNullOrWhiteSpace(transferToken))
+        {
+            return;
+        }
+
+        var receivedBytes = Mathf.Max(0, reader.ReadInt32());
+        var activeTransferKey = $"{connectionId}|{transferToken}";
+        if (!outgoingTrackTransfers.TryGetValue(activeTransferKey, out var transfer) || transfer.FileBytes == null || transfer.FileBytes.Length <= 0)
+        {
+            return;
+        }
+
+        receivedBytes = Mathf.Clamp(receivedBytes, 0, transfer.FileBytes.Length);
+        if (receivedBytes < transfer.FileBytes.Length && Time.unscaledTime < transfer.NextClientProgressLogAt)
+        {
+            return;
+        }
+
+        transfer.NextClientProgressLogAt = Time.unscaledTime + TransferProgressLogIntervalSeconds;
+        var progress = Mathf.Clamp01(receivedBytes / (float)transfer.FileBytes.Length);
+        Plugin.LogInfo(
+            $"[MusicSync] Remote client {transfer.TargetSteamId} downloading {GetTrackIdentity(transfer.ToWireMessage())} {BuildTransferProgressBar(progress)} {progress * 100f:0}% ({FormatBytes(receivedBytes)} / {FormatBytes(transfer.FileBytes.Length)}).",
+            true,
+            Plugin.LogColorAccent);
     }
 
     private void FinalizeIncomingTransfer(IncomingTrackTransfer transfer)
@@ -1350,11 +1430,6 @@ internal sealed class MusicSyncController : MonoBehaviour
 
     private static string GetTransferKey(MusicSyncWireMessage state)
     {
-        if (!string.IsNullOrWhiteSpace(state.TransferToken))
-        {
-            return state.TransferToken.Trim();
-        }
-
         if (!string.IsNullOrWhiteSpace(state.AudioFileHash))
         {
             return state.AudioFileHash.Trim();
@@ -1383,33 +1458,17 @@ internal sealed class MusicSyncController : MonoBehaviour
     {
         yield return null;
 
-        OutgoingTrackTransfer transfer;
         var chunksSentThisFrame = 0;
         while (true)
         {
-            if (!outgoingTrackTransfers.TryGetValue(activeTransferKey, out transfer))
+            if (!outgoingTrackTransfers.TryGetValue(activeTransferKey, out var transfer))
             {
                 yield break;
             }
 
             if (transfer.NextChunkIndexToSend >= transfer.ChunkCount)
             {
-                if (transfer.AcknowledgedChunkCount >= transfer.ChunkCount)
-                {
-                    break;
-                }
-
-                chunksSentThisFrame = 0;
-                yield return null;
-                continue;
-            }
-
-            var outstandingChunkCount = transfer.NextChunkIndexToSend - transfer.AcknowledgedChunkCount;
-            if (outstandingChunkCount >= TransferWindowChunks)
-            {
-                chunksSentThisFrame = 0;
-                yield return null;
-                continue;
+                break;
             }
 
             var connection = transfer.Connection;
@@ -1419,6 +1478,7 @@ internal sealed class MusicSyncController : MonoBehaviour
                 if (connection != null)
                 {
                     transfer.Connection = connection;
+                    transfer.TargetConnectionId = connection.ClientId;
                 }
             }
 
@@ -1430,33 +1490,30 @@ internal sealed class MusicSyncController : MonoBehaviour
             }
 
             var chunkIndex = transfer.NextChunkIndexToSend;
-            var offset = chunkIndex * TransferChunkSizeBytes;
-            var count = Mathf.Min(TransferChunkSizeBytes, transfer.FileBytes.Length - offset);
-            BroadcastToClient(connection, new MusicSyncWireMessage
+            var offset = chunkIndex * transfer.ChunkSizeBytes;
+            var count = Mathf.Min(transfer.ChunkSizeBytes, transfer.FileBytes.Length - offset);
+            if (!TrySendRawTrackTransferChunk(connection, transfer, chunkIndex, offset, count))
             {
-                MessageType = MusicSyncMessageType.TrackTransferChunk,
-                TransferToken = transfer.ClientTransferKey,
-                TargetSteamId = transfer.TargetSteamId,
-                SourceSteamId = GetLocalSteamId(),
-                ChunkIndex = chunkIndex,
-                ChunkCount = transfer.ChunkCount,
-                ChunkDataBase64 = Convert.ToBase64String(transfer.FileBytes, offset, count)
-            });
+                outgoingTrackTransfers.Remove(activeTransferKey);
+                activeHostTransferKeys.Remove(activeTransferKey);
+                yield break;
+            }
+
             transfer.SentBytes += count;
             transfer.NextChunkIndexToSend++;
             MaybeLogOutgoingTransferProgress(transfer);
 
             chunksSentThisFrame++;
-            if (chunksSentThisFrame >= TransferChunksPerFrame)
+            if (chunksSentThisFrame >= GetTransferProfile(transfer.ProfileIndex).ChunksPerFrame)
             {
                 chunksSentThisFrame = 0;
                 yield return null;
             }
         }
 
-        if (outgoingTrackTransfers.TryGetValue(activeTransferKey, out transfer))
+        if (outgoingTrackTransfers.TryGetValue(activeTransferKey, out var completedTransfer))
         {
-            Plugin.LogInfo($"[MusicSync] Completed host track transfer for {GetTrackIdentity(transfer.ToWireMessage())} to client {transfer.TargetSteamId}.", true, Plugin.LogColorSuccess);
+            Plugin.LogInfo($"[MusicSync] Completed host track transfer for {GetTrackIdentity(completedTransfer.ToWireMessage())} to client {completedTransfer.TargetSteamId}.", true, Plugin.LogColorSuccess);
         }
 
         outgoingTrackTransfers.Remove(activeTransferKey);
@@ -1501,13 +1558,90 @@ internal sealed class MusicSyncController : MonoBehaviour
             return fallbackConnection;
         }
 
+        if (TryGetCachedClientConnection(targetSteamId, out var cachedConnection))
+        {
+            return cachedConnection;
+        }
+
         if (TryResolveConnectionForSteamId(targetSteamId, out var resolvedConnection))
         {
+            clientConnectionsBySteamId[targetSteamId] = resolvedConnection;
             return resolvedConnection;
         }
 
         Plugin.LogWarning($"[MusicSync] Could not resolve a live connection for client {targetSteamId} while {context}.", true);
         return null;
+    }
+
+    private void HandleTransportLimitExceeded(bool serverSide)
+    {
+        if (!serverSide || outgoingTrackTransfers.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var transfer in new List<OutgoingTrackTransfer>(outgoingTrackTransfers.Values))
+        {
+            var nextProfileIndex = Mathf.Min(transfer.ProfileIndex + 1, TransferProfiles.Length - 1);
+            preferredTransferProfileIndexByKey[transfer.TargetSteamId] = nextProfileIndex;
+            Plugin.LogWarning(
+                $"[MusicSync] Transfer hit the Steam send limit while streaming {GetTrackIdentity(transfer.ToWireMessage())}. Falling back to {DescribeTransferProfile(nextProfileIndex)} on the next retry.",
+                true);
+        }
+
+        outgoingTrackTransfers.Clear();
+        activeHostTransferKeys.Clear();
+        nextHostSyncAt = Time.unscaledTime;
+    }
+
+    private static TransferProfile GetTransferProfile(int profileIndex)
+    {
+        return TransferProfiles[Mathf.Clamp(profileIndex, 0, TransferProfiles.Length - 1)];
+    }
+
+    private int GetPreferredTransferProfileIndex(string targetSteamId)
+    {
+        if (string.IsNullOrWhiteSpace(targetSteamId) ||
+            !preferredTransferProfileIndexByKey.TryGetValue(targetSteamId, out var profileIndex))
+        {
+            return 0;
+        }
+
+        return Mathf.Clamp(profileIndex, 0, TransferProfiles.Length - 1);
+    }
+
+    private static string DescribeTransferProfile(int profileIndex)
+    {
+        var profile = GetTransferProfile(profileIndex);
+        return $"{profile.Name} ({profile.ChunksPerFrame}/frame @ {profile.ChunkSizeBytes}B)";
+    }
+
+    private void RememberClientConnection(NetworkConnection connection, string steamId)
+    {
+        if (connection == null || !connection.IsActive || string.IsNullOrWhiteSpace(steamId))
+        {
+            return;
+        }
+
+        clientConnectionsBySteamId[steamId] = connection;
+    }
+
+    private bool TryGetCachedClientConnection(string steamId, out NetworkConnection connection)
+    {
+        connection = null;
+        if (string.IsNullOrWhiteSpace(steamId) || !clientConnectionsBySteamId.TryGetValue(steamId, out var cachedConnection))
+        {
+            return false;
+        }
+
+        if (cachedConnection != null && cachedConnection.IsActive)
+        {
+            connection = cachedConnection;
+            return true;
+        }
+
+        clientConnectionsBySteamId.Remove(steamId);
+        return false;
     }
 
     private void MarkTrackTransferRequested(string transferKey)
@@ -1527,34 +1661,192 @@ internal sealed class MusicSyncController : MonoBehaviour
         requestedTrackTransferAtByKey.Remove(transferKey);
     }
 
-    private void RequestNextTrackTransferChunk(IncomingTrackTransfer transfer, int chunkIndex)
+    private void CleanupStalledIncomingTransfers()
     {
-        if (transfer == null || string.IsNullOrWhiteSpace(transfer.SourceSteamId))
+        if (incomingTrackTransfers.Count == 0)
         {
             return;
         }
 
-        var requesterSteamId = string.IsNullOrWhiteSpace(transfer.RequesterSteamId)
-            ? GetLocalSteamId()
-            : transfer.RequesterSteamId;
-        if (string.IsNullOrWhiteSpace(requesterSteamId))
+        var now = Time.unscaledTime;
+        foreach (var transferKey in new List<string>(incomingTrackTransfers.Keys))
         {
-            Plugin.LogWarning($"[MusicSync] Could not request host track chunk {chunkIndex} for {GetTrackIdentity(new MusicSyncWireMessage { TrackNumber = transfer.TrackNumber, TrackName = transfer.TrackName, ArtistName = transfer.ArtistName })} because the local Steam ID is not available yet.", true);
+            if (!incomingTrackTransfers.TryGetValue(transferKey, out var transfer) ||
+                now - transfer.LastChunkReceivedAt < TrackTransferStallTimeoutSeconds)
+            {
+                continue;
+            }
+
+            Plugin.LogWarning($"[MusicSync] Host track transfer stalled for {GetTrackIdentity(new MusicSyncWireMessage { TrackNumber = transfer.TrackNumber, TrackName = transfer.TrackName, ArtistName = transfer.ArtistName })}. Retrying.", true);
+            ClearRequestedTrackTransfer(transferKey);
+            CleanupIncomingTransfer(transferKey);
+        }
+    }
+
+    private int ResolveTransferChunkSizeBytes(TransferProfile profile)
+    {
+        if (!TryGetTransport(out var transport))
+        {
+            return profile.ChunkSizeBytes;
+        }
+
+        var mtu = transport.GetMTU((byte)Channel.Reliable);
+        if (mtu <= 0)
+        {
+            return profile.ChunkSizeBytes;
+        }
+
+        return Mathf.Clamp(Mathf.Min(profile.ChunkSizeBytes, mtu - RawTransferHeaderBudgetBytes), MinTransferChunkSizeBytes, profile.ChunkSizeBytes);
+    }
+
+    private void MaybeSendIncomingTransferProgress(IncomingTrackTransfer transfer)
+    {
+        if (transfer == null || transfer.FileSizeBytes <= 0)
+        {
             return;
         }
 
-        BroadcastFromClient(new MusicSyncWireMessage
+        if (transfer.ReceivedBytes < transfer.FileSizeBytes && Time.unscaledTime < transfer.NextProgressReportAt)
         {
-            MessageType = MusicSyncMessageType.RequestTrackTransferChunk,
-            SourceSteamId = requesterSteamId,
-            TargetSteamId = transfer.SourceSteamId,
-            TrackNumber = transfer.TrackNumber,
-            TrackName = transfer.TrackName,
-            ArtistName = transfer.ArtistName,
-            AudioFileHash = transfer.AudioFileHash,
-            AudioFileStem = transfer.AudioFileStem,
-            ChunkIndex = chunkIndex
-        });
+            return;
+        }
+
+        transfer.NextProgressReportAt = Time.unscaledTime + TransferProgressLogIntervalSeconds;
+        TrySendRawTrackTransferProgress(transfer.TransferKey, transfer.ReceivedBytes);
+    }
+
+    private static bool TryGetTransport(out Transport transport)
+    {
+        transport = null;
+        if (InstanceFinder.TransportManager == null || TransportField == null)
+        {
+            return false;
+        }
+
+        transport = TransportField.GetValue(InstanceFinder.TransportManager) as Transport;
+        return transport != null;
+    }
+
+    private static bool TrySendRawPacketToClient(NetworkConnection connection, byte[] packet, Channel channel = Channel.Reliable)
+    {
+        if (connection == null || packet == null || packet.Length == 0 || !TryGetTransport(out var transport))
+        {
+            return false;
+        }
+
+        var buffer = new byte[packet.Length + 1];
+        Buffer.BlockCopy(packet, 0, buffer, 0, packet.Length);
+        transport.SendToClient((byte)channel, new ArraySegment<byte>(buffer, 0, packet.Length), connection.ClientId);
+        return true;
+    }
+
+    private static bool TrySendRawPacketToServer(byte[] packet, Channel channel = Channel.Reliable)
+    {
+        if (packet == null || packet.Length == 0 || !TryGetTransport(out var transport))
+        {
+            return false;
+        }
+
+        var buffer = new byte[packet.Length + 1];
+        Buffer.BlockCopy(packet, 0, buffer, 0, packet.Length);
+        transport.SendToServer((byte)channel, new ArraySegment<byte>(buffer, 0, packet.Length));
+        return true;
+    }
+
+    private static bool TrySendRawTrackTransferStart(NetworkConnection connection, OutgoingTrackTransfer transfer)
+    {
+        return TrySendRawPacketToClient(connection, BuildRawTransferPacket(MusicSyncTransferPacketType.Start, writer =>
+        {
+            writer.Write(transfer.TransferToken);
+            writer.Write(transfer.TrackNumber);
+            writer.Write(transfer.TrackName ?? string.Empty);
+            writer.Write(transfer.ArtistName ?? string.Empty);
+            writer.Write(transfer.AudioFileHash ?? string.Empty);
+            writer.Write(transfer.AudioFileStem ?? string.Empty);
+            writer.Write(transfer.AudioFileExtension ?? string.Empty);
+            writer.Write(transfer.FileBytes.Length);
+            writer.Write(transfer.ChunkCount);
+        }));
+    }
+
+    private static bool TrySendRawTrackTransferChunk(NetworkConnection connection, OutgoingTrackTransfer transfer, int chunkIndex, int offset, int count)
+    {
+        return TrySendRawPacketToClient(connection, BuildRawTransferPacket(MusicSyncTransferPacketType.Chunk, writer =>
+        {
+            writer.Write(transfer.TransferToken);
+            writer.Write(chunkIndex);
+            writer.Write(count);
+            writer.Write(transfer.FileBytes, offset, count);
+        }));
+    }
+
+    private static bool TrySendRawTrackTransferProgress(string transferKey, int transferredBytes)
+    {
+        return TrySendRawPacketToServer(BuildRawTransferPacket(MusicSyncTransferPacketType.Progress, writer =>
+        {
+            writer.Write(transferKey ?? string.Empty);
+            writer.Write(transferredBytes);
+        }), Channel.Unreliable);
+    }
+
+    private void SendTrackTransferFailure(NetworkConnection connection, string transferKey, MusicSyncWireMessage request, string reason)
+    {
+        if (connection == null)
+        {
+            return;
+        }
+
+        TrySendRawPacketToClient(connection, BuildRawTransferPacket(MusicSyncTransferPacketType.Failed, writer =>
+        {
+            writer.Write(transferKey ?? GetTransferKey(request) ?? string.Empty);
+            writer.Write(request.TrackNumber);
+            writer.Write(request.TrackName ?? string.Empty);
+            writer.Write(request.ArtistName ?? string.Empty);
+            writer.Write(reason ?? string.Empty);
+        }));
+    }
+
+    private static byte[] BuildRawTransferPacket(MusicSyncTransferPacketType packetType, Action<BinaryWriter> writePayload)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, true);
+        writer.Write(RawTransferMagic);
+        writer.Write(RawTransferVersion);
+        writer.Write((byte)packetType);
+        writePayload(writer);
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    private static bool TryCreateRawPacketReader(ArraySegment<byte> data, out BinaryReader reader, out MusicSyncTransferPacketType packetType)
+    {
+        reader = null;
+        packetType = default;
+        if (data.Array == null || data.Count < sizeof(int) + 2)
+        {
+            return false;
+        }
+
+        var stream = new MemoryStream(data.Array, data.Offset, data.Count, false);
+        var binaryReader = new BinaryReader(stream, Encoding.UTF8, false);
+
+        try
+        {
+            if (binaryReader.ReadInt32() != RawTransferMagic || binaryReader.ReadByte() != RawTransferVersion)
+            {
+                binaryReader.Dispose();
+                return false;
+            }
+
+            packetType = (MusicSyncTransferPacketType)binaryReader.ReadByte();
+            reader = binaryReader;
+            return true;
+        }
+        catch
+        {
+            binaryReader.Dispose();
+            return false;
+        }
     }
 
     private void MaybeLogOutgoingTransferProgress(OutgoingTrackTransfer transfer)
@@ -1597,63 +1889,6 @@ internal sealed class MusicSyncController : MonoBehaviour
             Plugin.LogColorAccent);
     }
 
-    private void HandleClientTrackTransferProgress(MusicSyncWireMessage wireMessage)
-    {
-        if (string.IsNullOrWhiteSpace(wireMessage.SourceSteamId) || string.IsNullOrWhiteSpace(wireMessage.TransferToken))
-        {
-            return;
-        }
-
-        var activeTransferKey = $"{wireMessage.SourceSteamId}|{wireMessage.TransferToken}";
-        if (!outgoingTrackTransfers.TryGetValue(activeTransferKey, out var transfer) || transfer.FileBytes == null || transfer.FileBytes.Length <= 0)
-        {
-            return;
-        }
-
-        var receivedBytes = Mathf.Clamp(wireMessage.TransferredBytes, 0, transfer.FileBytes.Length);
-        var acknowledgedChunkCount = Mathf.Clamp(
-            Mathf.CeilToInt(receivedBytes / (float)TransferChunkSizeBytes),
-            transfer.AcknowledgedChunkCount,
-            transfer.ChunkCount);
-        transfer.AcknowledgedChunkCount = acknowledgedChunkCount;
-
-        if (receivedBytes < transfer.FileBytes.Length && Time.unscaledTime < transfer.NextClientProgressLogAt)
-        {
-            return;
-        }
-
-        transfer.NextClientProgressLogAt = Time.unscaledTime + TransferProgressLogIntervalSeconds;
-        var progress = Mathf.Clamp01(receivedBytes / (float)transfer.FileBytes.Length);
-        Plugin.LogInfo(
-            $"[MusicSync] Remote client {wireMessage.SourceSteamId} downloading {GetTrackIdentity(transfer.ToWireMessage())} {BuildTransferProgressBar(progress)} {progress * 100f:0}% ({FormatBytes(receivedBytes)} / {FormatBytes(transfer.FileBytes.Length)}).",
-            true,
-            Plugin.LogColorAccent);
-    }
-
-    private void MaybeSendIncomingTransferAck(IncomingTrackTransfer transfer, bool force)
-    {
-        if (transfer == null || transfer.FileSizeBytes <= 0)
-        {
-            return;
-        }
-
-        if (!force && transfer.NextChunkIndex - transfer.LastAcknowledgedChunkIndex < TransferAckEveryChunks)
-        {
-            return;
-        }
-
-        transfer.LastAcknowledgedChunkIndex = transfer.NextChunkIndex;
-        BroadcastFromClient(new MusicSyncWireMessage
-        {
-            MessageType = MusicSyncMessageType.TrackTransferProgress,
-            TransferToken = transfer.TransferKey,
-            SourceSteamId = transfer.RequesterSteamId,
-            TargetSteamId = transfer.SourceSteamId,
-            TransferredBytes = transfer.ReceivedBytes,
-            FileSizeBytes = transfer.FileSizeBytes
-        });
-    }
-
     private static string BuildTransferProgressBar(float progress)
     {
         var clampedProgress = Mathf.Clamp01(progress);
@@ -1683,6 +1918,8 @@ internal sealed class MusicSyncController : MonoBehaviour
     {
         outgoingTrackTransfers.Clear();
         activeHostTransferKeys.Clear();
+        clientConnectionsBySteamId.Clear();
+        preferredTransferProfileIndexByKey.Clear();
     }
 
     private void CleanupIncomingTransfer(string transferKey)
@@ -1712,22 +1949,6 @@ internal sealed class MusicSyncController : MonoBehaviour
         catch
         {
         }
-    }
-
-    private void SendTrackTransferFailure(NetworkConnection connection, string targetSteamId, MusicSyncWireMessage request, string reason)
-    {
-        BroadcastToClient(connection, new MusicSyncWireMessage
-        {
-            MessageType = MusicSyncMessageType.TrackTransferFailed,
-            TargetSteamId = targetSteamId,
-            SourceSteamId = GetLocalSteamId(),
-            TrackNumber = request.TrackNumber,
-            TrackName = request.TrackName,
-            ArtistName = request.ArtistName,
-            AudioFileHash = request.AudioFileHash,
-            AudioFileStem = request.AudioFileStem,
-            ErrorMessage = reason
-        });
     }
 
     private void EnsureBroadcastHandlersRegistered()
@@ -1766,6 +1987,14 @@ internal sealed class MusicSyncController : MonoBehaviour
         requestedTrackTransferKeys.Clear();
         requestedTrackTransferAtByKey.Clear();
         CleanupIncomingTransfers();
+        CleanupActiveOutgoingTransfers();
+    }
+
+    private void CleanupActiveOutgoingTransfers()
+    {
+        outgoingTrackTransfers.Clear();
+        activeHostTransferKeys.Clear();
+        clientConnectionsBySteamId.Clear();
     }
 
     private static void BroadcastToClients(MusicSyncWireMessage state)
@@ -1780,20 +2009,6 @@ internal sealed class MusicSyncController : MonoBehaviour
             username = BroadcastUserName,
             message = JsonConvert.SerializeObject(state)
         });
-    }
-
-    private static void BroadcastToClient(NetworkConnection connection, MusicSyncWireMessage state)
-    {
-        if (!InstanceFinder.IsServer || InstanceFinder.ServerManager == null || connection == null)
-        {
-            return;
-        }
-
-        InstanceFinder.ServerManager.Broadcast(connection, new ChatBroadcast.Message
-        {
-            username = BroadcastUserName,
-            message = JsonConvert.SerializeObject(state)
-        }, false, Channel.Reliable);
     }
 
     private static bool TryGetCurrentLobbyId(out CSteamID lobbyId)
@@ -1969,19 +2184,12 @@ internal static class MusicSyncMessageType
 {
     internal const string Request = "request";
     internal const string RequestTrackTransfer = "request_track_transfer";
-    internal const string RequestTrackTransferChunk = "request_track_transfer_chunk";
     internal const string State = "state";
-    internal const string TrackTransferChunk = "track_transfer_chunk";
-    internal const string TrackTransferFailed = "track_transfer_failed";
-    internal const string TrackTransferProgress = "track_transfer_progress";
-    internal const string TrackTransferStart = "track_transfer_start";
 }
 
 internal sealed class MusicSyncWireMessage
 {
     public string MessageType { get; set; }
-
-    public string TransferToken { get; set; }
 
     public long Sequence { get; set; }
 
@@ -1995,36 +2203,24 @@ internal sealed class MusicSyncWireMessage
 
     public string AudioFileStem { get; set; }
 
-    public string AudioFileExtension { get; set; }
-
-    public string TargetSteamId { get; set; }
-
     public string SourceSteamId { get; set; }
-
-    public string ErrorMessage { get; set; }
-
-    public int ChunkIndex { get; set; }
-
-    public int ChunkCount { get; set; }
-
-    public int FileSizeBytes { get; set; }
-
-    public int TransferredBytes { get; set; }
-
-    public string ChunkDataBase64 { get; set; }
 
     public float PositionSeconds { get; set; }
 
     public bool Paused { get; set; }
 }
 
+internal enum MusicSyncTransferPacketType : byte
+{
+    Start = 1,
+    Chunk = 2,
+    Progress = 3,
+    Failed = 4
+}
+
 internal sealed class IncomingTrackTransfer
 {
     public string TransferKey { get; set; }
-
-    public string SourceSteamId { get; set; }
-
-    public string RequesterSteamId { get; set; }
 
     public string AudioFileHash { get; set; }
 
@@ -2040,9 +2236,11 @@ internal sealed class IncomingTrackTransfer
 
     public int ReceivedBytes { get; set; }
 
-    public int LastAcknowledgedChunkIndex { get; set; }
-
     public float NextProgressLogAt { get; set; }
+
+    public float NextProgressReportAt { get; set; }
+
+    public float LastChunkReceivedAt { get; set; }
 
     public string TempPath { get; set; }
 
@@ -2061,9 +2259,11 @@ internal sealed class OutgoingTrackTransfer
 {
     public string TransferKey { get; set; }
 
-    public string ClientTransferKey { get; set; }
+    public string TransferToken { get; set; }
 
     public NetworkConnection Connection { get; set; }
+
+    public int TargetConnectionId { get; set; }
 
     public string TargetSteamId { get; set; }
 
@@ -2079,15 +2279,17 @@ internal sealed class OutgoingTrackTransfer
 
     public string AudioFileExtension { get; set; }
 
+    public int ChunkSizeBytes { get; set; }
+
     public int ChunkCount { get; set; }
 
     public byte[] FileBytes { get; set; }
 
+    public int ProfileIndex { get; set; }
+
     public int SentBytes { get; set; }
 
     public int NextChunkIndexToSend { get; set; }
-
-    public int AcknowledgedChunkCount { get; set; }
 
     public float NextProgressLogAt { get; set; }
 
@@ -2104,4 +2306,20 @@ internal sealed class OutgoingTrackTransfer
             AudioFileStem = AudioFileStem
         };
     }
+}
+
+internal readonly struct TransferProfile
+{
+    public TransferProfile(string name, int chunksPerFrame, int chunkSizeBytes)
+    {
+        Name = name;
+        ChunksPerFrame = chunksPerFrame;
+        ChunkSizeBytes = chunkSizeBytes;
+    }
+
+    public string Name { get; }
+
+    public int ChunksPerFrame { get; }
+
+    public int ChunkSizeBytes { get; }
 }
