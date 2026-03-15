@@ -205,7 +205,7 @@ internal sealed class MusicSyncController : MonoBehaviour
 
     internal static bool ShouldOverrideInGameMusic()
     {
-        return Instance != null && Instance.IsFollowerClient() && Instance.hasRemoteSync;
+        return Instance != null && Instance.IsFollowerClient();
     }
 
     internal static bool IsApplyingRemoteState()
@@ -780,7 +780,7 @@ internal sealed class MusicSyncController : MonoBehaviour
 
     private bool IsFollowerClient()
     {
-        return IsSyncContextActive() && !IsHost();
+        return hasRemoteSync && IsSyncContextActive() && !IsHost();
     }
 
     private static bool IsHost()
